@@ -2,7 +2,9 @@ package covers
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
+	"path"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,7 +17,7 @@ const TagName = "//covers:"
 
 var (
 	ErrNoCoverage = errors.New("coverage not enabled (-cover)")
-	ErrWrongMode  = errors.New("coverage mode not supported for operation")
+	ErrWrongMode  = errors.New("mode not supported for operation")
 )
 
 //go:linkname cover testing.cover
@@ -33,7 +35,7 @@ func Should(t testing.TB) *Covers {
 
 	c, err := Setup(t)
 	if err != nil {
-		t.Logf("problem setting up coverage testing %v", err)
+		t.Logf("problem setting up coverage testing: %v", err)
 	}
 	return c
 }
@@ -43,7 +45,7 @@ func Must(t testing.TB) *Covers {
 
 	c, err := Setup(t)
 	if err != nil {
-		t.Fatalf("problem setting up coverage testing %v", err)
+		t.Fatalf("problem setting up coverage testing: %v", err)
 	}
 	return c
 }
@@ -52,14 +54,27 @@ func Setup(t testing.TB) (*Covers, error) {
 	t.Helper()
 
 	c := &Covers{
-		t: t,
+		t:      t,
+		values: map[string]*uint32{},
 	}
 
-	if testing.CoverMode() == "" {
-		return nil, ErrNoCoverage
+	var err error
+	switch cm := testing.CoverMode(); cm {
+	case "count", "atomic":
+		c.isEnabled = true
+	case "":
+		err = ErrNoCoverage
+	case "set":
+		fallthrough
+	default:
+		err = fmt.Errorf("%v; was \"%s\". Try -covermode atomic|count", ErrWrongMode, cm)
 	}
 
-	c.init(t)
+	c.values = mustInit(t, c.isEnabled)
+	if err != nil {
+		return c, err
+	}
+
 	t.Cleanup(func() {
 		t.Helper()
 		c.done(t)
@@ -69,18 +84,23 @@ func Setup(t testing.TB) (*Covers, error) {
 
 type Covers struct {
 	finishedCB
-	before testing.Cover
-	t      testing.TB
-	values map[string]*uint32
+	before    testing.Cover
+	t         testing.TB
+	values    map[string]*uint32
+	isEnabled bool
 }
 
 func (c *Covers) Tag(tag string) *Counter {
 	ctr, ok := c.values[tag]
 	if !ok {
-		c.t.Fatalf("tag not found: %s", tag)
+		c.t.Fatalf("covers tag not found: %s", tag)
+	}
+	var old uint32
+	if ctr != nil {
+		old = atomic.LoadUint32(ctr)
 	}
 	counter := &Counter{
-		old:  atomic.LoadUint32(ctr),
+		old:  old,
 		ctr:  ctr,
 		name: tag,
 	}
@@ -88,10 +108,29 @@ func (c *Covers) Tag(tag string) *Counter {
 	return counter
 }
 
-func (c *Covers) init(t testing.TB) {
+var (
+	mustInitOnce   atomic.Bool
+	mustInitValues map[string]*uint32
+)
+
+func mustInit(t testing.TB, coverageEnabled bool) map[string]*uint32 {
 	t.Helper()
 
-	// the code to build tag to counter map ("values") really should be package scope and sync.Once
+	if mustInitOnce.Load() {
+		return mustInitValues
+	}
+	defer func() { mustInitOnce.Store(true) }()
+
+	pkgsForGettingModulePath, err := packages.Load(&packages.Config{
+		Mode: packages.NeedModule,
+	})
+	if err != nil {
+		t.Fatalf("packages.Load: %v", err)
+	}
+	if len(pkgsForGettingModulePath) < 1 {
+		t.Fatalf("packages.Load was empty")
+	}
+	modulePath := pkgsForGettingModulePath[0].Module.Path
 
 	cfg := &packages.Config{
 		Mode: packages.NeedSyntax |
@@ -102,17 +141,20 @@ func (c *Covers) init(t testing.TB) {
 		// Logf:  t.Logf,
 		Tests: true,
 	}
-	pkgs, err := packages.Load(cfg, "./...")
+
+	pkgs, err := packages.Load(cfg, path.Join(modulePath, "..."))
 	if err != nil {
 		t.Fatalf("packages.Load: %v", err)
 	}
 
 	values := make(map[string]*uint32) // tag key -> output values
 	for _, pkg := range pkgs {
+
 		commentMap := make(map[string][]*ast.Comment) // maps a file to the list of its tagged comments
 		targetMap := make(map[*ast.Comment]string)    // which output registers get incremented by a comment
 		dir := pkg.Module.Dir
 		path := pkg.Module.Path
+
 		for i, f := range pkg.CompiledGoFiles {
 			if strings.HasPrefix(f, dir) {
 				pathWithModule := strings.Replace(f, dir, path, 1)
@@ -124,11 +166,19 @@ func (c *Covers) init(t testing.TB) {
 							commentMapEntry = append(commentMapEntry, c)
 							target := strings.TrimPrefix(c.Text, TagName)
 							targetMap[c] = target
+							if !coverageEnabled {
+								// when in Should or May mode we still want to fail on missing tags
+								values[target] = nil
+							}
 						}
 					}
 				}
 				commentMap[pathWithModule] = commentMapEntry
 			}
+		}
+
+		if !coverageEnabled {
+			continue
 		}
 
 		for file, blocks := range cover.Blocks {
@@ -159,7 +209,9 @@ func (c *Covers) init(t testing.TB) {
 					if !ok {
 						t.Fatalf("target not found for comment!")
 					}
-					if _, ok := values[target]; ok {
+					// In tests there are two pkgs for each pkg - with and without tests
+					// We should probably only visit each file once!
+					if otherCtr, ok := values[target]; ok && otherCtr != ctr {
 						t.Fatalf("duplicated tag %s", comment.Text)
 					}
 					values[target] = ctr
@@ -168,7 +220,8 @@ func (c *Covers) init(t testing.TB) {
 			}
 		}
 	}
-	c.values = values
+	mustInitValues = values
+	return mustInitValues
 }
 
 type finishedCB struct {
@@ -192,13 +245,7 @@ type Counter struct {
 func (c *Counter) Run(f func(delta uint32)) {
 	c.run(func(t testing.TB, delta uint32) {
 		t.Helper()
-		switch cm := testing.CoverMode(); cm {
-		case "count", "atomic":
-		case "set":
-			fallthrough
-		default:
-			t.Fatalf("%v; was %s. Try -covermode atomic|count", ErrWrongMode, cm)
-		}
+
 		f(delta)
 	})
 }
@@ -215,7 +262,7 @@ func (c *Counter) IsZero() {
 	c.run(func(t testing.TB, delta uint32) {
 		t.Helper()
 		if delta != 0 {
-			t.Errorf("%s IsZero failed; was %d", c.name, delta)
+			t.Errorf("IsZero(%s) failed; was %d", c.name, delta)
 		}
 	})
 }
@@ -225,7 +272,7 @@ func (c *Counter) IsNotZero() {
 		t.Helper()
 
 		if delta == 0 {
-			t.Errorf("%s IsNotZero failed", c.name)
+			t.Errorf("IsNotZero(%s) failed", c.name)
 		}
 
 	})
