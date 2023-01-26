@@ -1,26 +1,36 @@
 package covers
 
 import (
-	"fmt"
+	"errors"
 	"go/ast"
 	"strings"
+	"sync/atomic"
 	"testing"
 	_ "unsafe"
 
 	"golang.org/x/tools/go/packages"
 )
 
+const TagName = "//covers:"
+
+var (
+	ErrNoCoverage = errors.New("coverage not enabled (-cover)")
+	ErrWrongMode  = errors.New("coverage mode not supported for operation")
+)
+
 //go:linkname cover testing.cover
 var cover testing.Cover
 
-const TagName = "//MustCover:"
-
 func May(t testing.TB) *Covers {
+	t.Helper()
+
 	c, _ := Setup(t)
 	return c
 }
 
 func Should(t testing.TB) *Covers {
+	t.Helper()
+
 	c, err := Setup(t)
 	if err != nil {
 		t.Logf("problem setting up coverage testing %v", err)
@@ -29,6 +39,8 @@ func Should(t testing.TB) *Covers {
 }
 
 func Must(t testing.TB) *Covers {
+	t.Helper()
+
 	c, err := Setup(t)
 	if err != nil {
 		t.Fatalf("problem setting up coverage testing %v", err)
@@ -37,59 +49,49 @@ func Must(t testing.TB) *Covers {
 }
 
 func Setup(t testing.TB) (*Covers, error) {
-	saved := clone(cover)
+	t.Helper()
 
 	c := &Covers{
-		before: saved,
-		t:      t,
+		t: t,
 	}
+
+	if testing.CoverMode() == "" {
+		return nil, ErrNoCoverage
+	}
+
+	c.init(t)
 	t.Cleanup(func() {
-		m := c.done(t)
-		t.Logf("map is %+v", m)
-		for _, f := range c.cbs {
-			f(m)
-		}
+		t.Helper()
+		c.done(t)
 	})
 	return c, nil
 }
 
 type Covers struct {
+	finishedCB
 	before testing.Cover
 	t      testing.TB
-	cbs    []func(map[string]uint32)
+	values map[string]*uint32
 }
 
-func (c *Covers) Key(key string, f func(uint32)) {
-	c.ForKeys(func(m map[string]uint32) {
-		f(m[key])
-	})
+func (c *Covers) Tag(tag string) *Counter {
+	ctr, ok := c.values[tag]
+	if !ok {
+		c.t.Fatalf("tag not found: %s", tag)
+	}
+	counter := &Counter{
+		old:  atomic.LoadUint32(ctr),
+		ctr:  ctr,
+		name: tag,
+	}
+	c.cbs = append(c.cbs, counter.done)
+	return counter
 }
 
-func (c *Covers) ForKeys(f func(map[string]uint32)) {
-	c.cbs = append(c.cbs, f)
-}
-func (c *Covers) HasKey(key string) {
-	c.Key(key, func(u uint32) {
-		if u < 1 {
-			c.t.Errorf("Covers.HasKey failed %s=%d", key, u)
-		}
-	})
-}
-func (c *Covers) NoHasKey(key string) {
-	c.Key(key, func(u uint32) {
-		if u > 0 {
-			c.t.Errorf("Covers.NoHasKey failed %s=%d", key, u)
-		}
-	})
-}
+func (c *Covers) init(t testing.TB) {
+	t.Helper()
 
-func (c *Covers) done(t testing.TB) map[string]uint32 {
-	out := make(map[string]uint32)
-	after := clone(cover)
-	// printFiles(t, "cached", c.before)
-	// printFiles(t, "after", after)
-	delta := diff(c.before, after)
-	// printFiles(t, "delta", delta)
+	// the code to build registers really should be package scope and sync.Once
 
 	cfg := &packages.Config{
 		Mode: packages.NeedSyntax |
@@ -100,13 +102,12 @@ func (c *Covers) done(t testing.TB) map[string]uint32 {
 		// Logf:  t.Logf,
 		Tests: true,
 	}
-
-	pkgs, err := packages.Load(cfg, "./...") // can likely sync.Once this
+	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		t.Fatalf("packages.Load: %v", err)
 	}
-	// t.Logf(after.CoveredPackages)
 
+	values := make(map[string]*uint32) // tag key -> output values
 	for _, pkg := range pkgs {
 		commentMap := make(map[string][]*ast.Comment) // maps a file to the list of its tagged comments
 		targetMap := make(map[*ast.Comment]string)    // which output registers get incremented by a comment
@@ -130,8 +131,9 @@ func (c *Covers) done(t testing.TB) map[string]uint32 {
 			}
 		}
 		// ^ all of this can be done once per test run
+		// maybe below too?
 
-		for file, blocks := range delta.Blocks {
+		for file, blocks := range cover.Blocks {
 			commentMapEntry, ok := commentMap[file]
 			if !ok {
 				// t.Logf("no comment map for %s", file)
@@ -154,69 +156,79 @@ func (c *Covers) done(t testing.TB) map[string]uint32 {
 						commentPos.Column > int(block.Col1) {
 						continue
 					}
-					ctr := delta.Counters[file][i]
-					if ctr == 0 {
-						continue
-					}
-					t.Logf("comment %+v matched block %+v; ctr %d", commentPos, block, ctr)
-					fmt.Println(comment.Text)
+					ctr := &cover.Counters[file][i]
 					target, ok := targetMap[comment]
 					if !ok {
 						t.Fatalf("target not found for comment!")
 					}
-					out[target] = ctr
+					if _, ok := values[target]; ok {
+						t.Fatalf("duplicated tag %s", comment.Text)
+					}
+					values[target] = ctr
+					// t.Logf("comment %+v matched block %+v; tag %s", commentPos, block, target)
 				}
 			}
 		}
 	}
-	return out
+	c.values = values
 }
 
-func printFiles(t testing.TB, label string, c testing.Cover) {
-	t.Logf("== %s ==", label)
-	for file, blocks := range c.Blocks {
-		t.Logf("%s: %d", file, len(blocks))
-		for i, b := range blocks {
-			v := c.Counters[file][i] // could be atomic
-			if v == 0 {
-				continue
-			}
-			t.Logf("%s#L%dC%d-L%dC%d: %+v", file, b.Line0, b.Col0, b.Line1, b.Col1, v)
+type finishedCB struct {
+	cbs []func(testing.TB)
+}
+
+func (d *finishedCB) done(t testing.TB) {
+	t.Helper()
+	for _, f := range d.cbs {
+		f(t)
+	}
+}
+
+type Counter struct {
+	name string
+	finishedCB
+	old uint32
+	ctr *uint32
+}
+
+func (c *Counter) Run(f func(delta uint32)) {
+	c.run(func(t testing.TB, delta uint32) {
+		t.Helper()
+		switch cm := testing.CoverMode(); cm {
+		case "count", "atomic":
+		case "set":
+			fallthrough
+		default:
+			t.Fatalf("%v; was %s. Try -covermode atomic|count", ErrWrongMode, cm)
 		}
-	}
+		f(delta)
+	})
 }
 
-func clone(in testing.Cover) testing.Cover {
-	out := zero(in)
-
-	for k := range in.Counters {
-		out.Counters[k] = make([]uint32, len(in.Counters[k]))
-		copy(out.Counters[k], in.Counters[k])
-	}
-
-	for k := range in.Blocks {
-		out.Blocks[k] = make([]testing.CoverBlock, len(in.Blocks[k]))
-		copy(out.Blocks[k], in.Blocks[k])
-	}
-
-	return out
+func (c *Counter) run(f func(t testing.TB, delta uint32)) {
+	c.cbs = append(c.cbs, func(t testing.TB) {
+		t.Helper()
+		new := atomic.LoadUint32(c.ctr)
+		f(t, new-c.old)
+	})
 }
 
-func zero(in testing.Cover) testing.Cover {
-	return testing.Cover{
-		Mode:            in.Mode,
-		Counters:        make(map[string][]uint32, len(in.Counters)),
-		Blocks:          make(map[string][]testing.CoverBlock, len(in.Blocks)),
-		CoveredPackages: in.CoveredPackages,
-	}
-}
+func (c *Counter) IsZero() {
+	c.run(func(t testing.TB, delta uint32) {
+		t.Helper()
 
-func diff(before, after testing.Cover) testing.Cover {
-	out := clone(after)
-	for file, perFileCounters := range before.Counters {
-		for i, v := range perFileCounters {
-			out.Counters[file][i] -= v // could be atomic
+		if delta != 0 {
+			t.Errorf("%s IsZero failed; was %d", c.name, delta)
 		}
-	}
-	return out
+	})
+}
+
+func (c *Counter) IsNotZero() {
+	c.run(func(t testing.TB, delta uint32) {
+		t.Helper()
+
+		if delta == 0 {
+			t.Errorf("%s IsNotZero failed", c.name)
+		}
+	})
 }

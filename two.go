@@ -6,5 +6,5 @@ import "fmt"
 func Two() {
 	fmt.Println("two") // comment two
 	// comment 2
-	//MustCover:foobar
+	//covers:foobar
 }
