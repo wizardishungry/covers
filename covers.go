@@ -91,7 +91,7 @@ func (c *Covers) Tag(tag string) *Counter {
 func (c *Covers) init(t testing.TB) {
 	t.Helper()
 
-	// the code to build registers really should be package scope and sync.Once
+	// the code to build tag to counter map ("values") really should be package scope and sync.Once
 
 	cfg := &packages.Config{
 		Mode: packages.NeedSyntax |
@@ -130,8 +130,6 @@ func (c *Covers) init(t testing.TB) {
 				commentMap[pathWithModule] = commentMapEntry
 			}
 		}
-		// ^ all of this can be done once per test run
-		// maybe below too?
 
 		for file, blocks := range cover.Blocks {
 			commentMapEntry, ok := commentMap[file]
@@ -216,7 +214,6 @@ func (c *Counter) run(f func(t testing.TB, delta uint32)) {
 func (c *Counter) IsZero() {
 	c.run(func(t testing.TB, delta uint32) {
 		t.Helper()
-
 		if delta != 0 {
 			t.Errorf("%s IsZero failed; was %d", c.name, delta)
 		}
@@ -230,5 +227,6 @@ func (c *Counter) IsNotZero() {
 		if delta == 0 {
 			t.Errorf("%s IsNotZero failed", c.name)
 		}
+
 	})
 }
