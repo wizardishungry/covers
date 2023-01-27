@@ -1,4 +1,4 @@
-package covers_test
+package test
 
 import (
 	"testing"
@@ -18,7 +18,7 @@ func TestOne(t *testing.T) {
 
 	defer ctrs.Tag("foobar", func(delta uint32) { require.Zero(t, delta) })
 
-	covers.One()
+	One()
 	ctrs.Tag("foobar", func(delta uint32) { t.Log("foobar was", delta) })
 
 }
@@ -26,8 +26,8 @@ func TestTwo(t *testing.T) {
 	ctrs := covers.Should(t)
 	defer ctrs.Tag("foobar", func(delta uint32) { require.NotZero(t, delta) })
 
-	covers.Two()
+	Two()
 	ctrs.Tag("foobar", func(delta uint32) { t.Log("foobar was", delta) })
-	covers.Two()
+	Two()
 	ctrs.Tag("foobar", func(delta uint32) { t.Log("foobar was", delta) })
 }
