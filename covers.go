@@ -92,15 +92,21 @@ type Counters struct {
 // Snapshot represents the state of the counters at a point in time
 type Snapshot struct {
 	counters *Counters
-	values   map[string]uint32
+	values   map[*uint32]uint32
 }
 
 func (c *Counters) NewSnapshot() Snapshot {
 	c.tb.Helper()
 
-	ss := make(map[string]uint32, len(c.counters))
+	ss := make(map[*uint32]uint32, len(c.counters))
 	for tag := range c.counters {
-		ss[tag] = atomic.LoadUint32(c.counters[tag])
+		addr := c.counters[tag]
+		var val uint32
+		if addr != nil {
+			// This code path is for when coverage is off
+			val = atomic.LoadUint32(addr)
+		}
+		ss[addr] = val
 	}
 	return Snapshot{
 		counters: c,
@@ -111,20 +117,20 @@ func (c *Counters) NewSnapshot() Snapshot {
 func (ss *Snapshot) Tag(tag string, f func(delta uint32)) {
 	ss.counters.tb.Helper()
 
-	oldValue, ok := ss.values[tag]
-	if !ok {
-		ss.counters.tb.Fatalf("tag not found: %s", tag)
-	}
-	ctr, ok := ss.counters.counters[tag]
+	addr, ok := ss.counters.counters[tag]
 	if !ok {
 		ss.counters.tb.Fatalf("tag not found in counters: %s", tag)
 	}
+	oldValue, ok := ss.values[addr]
+	if !ok {
+		ss.counters.tb.Fatalf("tag not found: %s", tag)
+	}
 
-	if ctr == nil {
-		// IIRC this code path is for when coverage is off
+	if addr == nil {
+		// This code path is for when coverage is off
 		return
 	}
-	value := atomic.LoadUint32(ctr)
+	value := atomic.LoadUint32(addr)
 	delta := value - oldValue
 	f(delta)
 }
