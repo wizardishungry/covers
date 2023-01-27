@@ -14,16 +14,21 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-const TagName = "//covers:"
+// TagPrefix is the prefix for machine-readable comments.
+// For example "//covers:DescriptiveName"
+const TagPrefix = "//covers:"
 
 var (
 	ErrNoCoverage = errors.New("coverage not enabled (-cover)")
 	ErrWrongMode  = errors.New("mode not supported for operation")
 )
 
+// cover is a way too get at an unexported identifer in the testing package.
+//
 //go:linkname cover testing.cover
 var cover testing.Cover
 
+// May loads a Counters struct if coverage is enabled. Otherwise the struct is non-functional.
 func May(t testing.TB) *Counters {
 	t.Helper()
 
@@ -31,26 +36,30 @@ func May(t testing.TB) *Counters {
 	return c
 }
 
+// Should loads a Counters struct if coverage is enabled. Otherwise the struct is non-functional.
+// It will log if coverage was not enabled via command line options.
 func Should(t testing.TB) *Counters {
 	t.Helper()
 
 	c, err := Setup(t)
 	if err != nil {
-		t.Logf("problem setting up coverage testing: %v", err)
+		t.Logf("Problem setting up coverage counters; skipping: %v", err)
 	}
 	return c
 }
 
+// Must loads a Counters struct if coverage is enabled. It will fail the test is coverage is unavailable.
 func Must(t testing.TB) *Counters {
 	t.Helper()
 
 	c, err := Setup(t)
 	if err != nil {
-		t.Fatalf("problem setting up coverage testing: %v", err)
+		t.Fatalf("Problem setting up coverage counters: %v", err)
 	}
 	return c
 }
 
+// Setup initializes a Counters object.
 func Setup(t testing.TB) (*Counters, error) {
 	t.Helper()
 
@@ -81,6 +90,7 @@ func Setup(t testing.TB) (*Counters, error) {
 	return c, nil
 }
 
+// Counters represents a mapping of machine-readable "//covers:" tags to coverage counters.
 type Counters struct {
 	before    testing.Cover
 	tb        testing.TB
@@ -89,12 +99,13 @@ type Counters struct {
 	Snapshot
 }
 
-// Snapshot represents the state of the counters at a point in time
+// Snapshot represents the state of the counters at a point in time.
 type Snapshot struct {
 	counters *Counters
 	values   map[*uint32]uint32
 }
 
+// NewSnapshot saves the value of coverage counters to a Snapshot.
 func (c *Counters) NewSnapshot() Snapshot {
 	c.tb.Helper()
 
@@ -114,6 +125,8 @@ func (c *Counters) NewSnapshot() Snapshot {
 	}
 }
 
+// Tag retrieves the change in a counter's value since a snapshot and runs a function on that value.
+// Functions may not be evaluated if we are running in an optional mode (Should or May).
 func (ss *Snapshot) Tag(tag string, f func(delta uint32)) {
 	ss.counters.tb.Helper()
 
@@ -140,6 +153,8 @@ var (
 	initCountersValue map[string]*uint32
 )
 
+// initCounters maps AST comment nodes tagged with //covers: tags to coverage counters
+// The AST parsing is performed once per package per test run.
 func initCounters(t testing.TB, coverageEnabled bool) map[string]*uint32 {
 	t.Helper()
 	initCountersOnce.Do(func() {
@@ -186,9 +201,9 @@ func initCounters(t testing.TB, coverageEnabled bool) map[string]*uint32 {
 					commentMapEntry := commentMap[pathWithModule]
 					for _, commentGroup := range syntax.Comments {
 						for _, c := range commentGroup.List {
-							if strings.HasPrefix(c.Text, TagName) {
+							if strings.HasPrefix(c.Text, TagPrefix) {
 								commentMapEntry = append(commentMapEntry, c)
-								target := strings.TrimPrefix(c.Text, TagName)
+								target := strings.TrimPrefix(c.Text, TagPrefix)
 								targetMap[c] = target
 								if !coverageEnabled {
 									// when in Should or May mode we still want to fail on missing tags
